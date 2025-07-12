@@ -1,3 +1,9 @@
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include <imgui.h>
 #include <config.h>
 #include <core.h>
@@ -5,7 +11,9 @@
 #include <gui/gui.h>
 #include <signal_path/signal_path.h>
 #include <module.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <fstream>
 #include "dvbs/module_dvbs_demod.h"
 #include "dvbs2/module_dvbs2_demod.h"
@@ -17,18 +25,20 @@
 
 #include "gui_widgets.h"
 
+SDRPP_MOD_INFO{
+    /* Name:            */ "dvbs_demodulator",
+    /* Description:     */ "DVB-S/DVB-S2 satellite decoder",
+    /* Author:          */ "cpicoto",
+    /* Version:         */ 1, 0, 0,
+    /* Max instances    */ -1
+};
+
+#ifdef ENABLE_NNG_NETWORKING
 #include <utils/net.h>
+#endif
 #include <utils/flog.h>
 
 #define CONCAT(a, b)    ((std::string(a) + b).c_str())
-
-SDRPP_MOD_INFO {
-    /* Name:            */ "dvbs_demodulator",
-    /* Description:     */ "DVB-S&DVB-S2 demodulator for SDR++(based on satdump demod code)",
-    /* Author:          */ "cropinghigh",
-    /* Version:         */ 0, 0, 5,
-    /* Max instances    */ -1
-};
 
 ConfigManager config;
 
@@ -184,15 +194,19 @@ private:
 
     void startNetwork() {
         stopNetwork();
+#ifdef ENABLE_NNG_NETWORKING
         try {
             conn = net::openudp(hostname, port);
         } catch (std::runtime_error& e) {
             flog::error("Network error: %s\n", e.what());
         }
+#endif
     }
 
     void stopNetwork() {
+#ifdef ENABLE_NNG_NETWORKING
         if (conn) { conn->close(); }
+#endif
     }
 
     void setMode() {
@@ -276,7 +290,11 @@ private:
         ImGui::Columns(1, CONCAT("EndDVBSModeColumns##_", _this->name), false);
         ImGui::EndGroup();
 
+#ifdef ENABLE_NNG_NETWORKING
         bool netActive = (_this->conn && _this->conn->isOpen());
+#else
+        bool netActive = false;
+#endif
         if(netActive) { style::beginDisabled(); }
         if (ImGui::InputText(CONCAT("UDP ##_dvbsdemod_host_", _this->name), _this->hostname, 1023)) {
             config.acquire();
@@ -532,13 +550,16 @@ private:
     static void _demodSinkHandler(uint8_t* data, int count, void* ctx) {
         DVBSDemodulatorModule* _this = (DVBSDemodulatorModule*)ctx;
         if(_this->dvbs_ver_selected == 0) {
+#ifdef ENABLE_NNG_NETWORKING
             if(_this->conn && _this->conn->isOpen())
                 _this->conn->send(data, count);
+#endif
         } else {
             int cnt = _this->dvbs2bbparser.work(data, count/(_this->dvbs2Demod.getKBCH()/8), _this->packetbuff, 65536*10);
             if(_this->dvbs2bbparser.last_header.ts_gs == 0b11) {
                 //MPEGTS
                 if(cnt > 0 && (cnt%188)==0) {
+#ifdef ENABLE_NNG_NETWORKING
                     for(int k = 0; k < cnt/1880; k++) {
                         if(_this->conn && _this->conn->isOpen())
                             _this->conn->send(&_this->packetbuff[1880*k], 1880);
@@ -546,12 +567,15 @@ private:
                     int rem = cnt%1880;
                     if(rem != 0 && _this->conn && _this->conn->isOpen())
                             _this->conn->send(&_this->packetbuff[cnt-rem], rem);
+#endif
                 }
             } else {
                 //GSE/OTHER
                 if(cnt > 0) {
+#ifdef ENABLE_NNG_NETWORKING
                     if(_this->conn && _this->conn->isOpen()) 
                         _this->conn->send(_this->packetbuff, cnt);
+#endif
                 }
             }
         }
@@ -616,7 +640,9 @@ private:
     char hostname[1024] = "127.0.0.1";
     int port = 4754;
 
+#ifdef ENABLE_NNG_NETWORKING
     std::shared_ptr<net::Socket> conn;
+#endif
 
 };
 

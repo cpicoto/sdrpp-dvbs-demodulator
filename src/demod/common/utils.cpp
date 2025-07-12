@@ -49,6 +49,8 @@ bool isStringPresent(std::string searched, std::string keyword)
     return found_it != std::string::npos;
 }
 
+// Disable networking code for Windows build - nng dependency not available
+#ifdef ENABLE_NNG_NETWORKING
 #include <nng/nng.h>
 #include <nng/supplemental/http/http.h>
 // #include "logger.h"
@@ -132,6 +134,7 @@ int perform_http_request(std::string url_str, std::string &result)
 
     return return_val;
 }*/
+#endif // ENABLE_NNG_NETWORKING
 
 std::string timestamp_to_string(double timestamp)
 {

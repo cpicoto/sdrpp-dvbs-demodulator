@@ -45,7 +45,7 @@ namespace dsp {
             {
                 uint64_t plheader = 0;
                 for (int y = 0; y < 64; y++) {
-                    bool value = (out[26 + y] * complex_t{cos(-M_PI / 4), sin(-M_PI / 4)}).re > 0;
+                    bool value = (out[26 + y] * complex_t{(float)cos(-M_PI / 4), (float)sin(-M_PI / 4)}).re > 0;
                     plheader = plheader << 1 | !value;
                 }
 

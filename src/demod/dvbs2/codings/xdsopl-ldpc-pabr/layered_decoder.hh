@@ -8,6 +8,10 @@ Copyright 2018 Ahmet Inan <xdsopl@gmail.com>
 #define LAYERED_DECODER_HH
 
 #include <stdlib.h>
+#include <vector>
+#ifdef _WIN32
+#include <malloc.h>  // For _aligned_malloc on Windows
+#endif
 #include "ldpc.hh"
 
 template <typename TYPE, typename ALG>
@@ -47,28 +51,27 @@ class LDPCDecoder
 	{
 		TYPE *bl = bnl;
 		for (int i = 0; i < q; ++i) {
-			int cnt = cnc[i];
-			for (int j = 0; j < M; ++j) {
-				int deg = cnt + 2 - !(i|j);
-				TYPE inp[deg], out[deg];
-				for (int c = 0; c < cnt; ++c)
-					inp[c] = out[c] = alg.sub(data[pos[CNL*(M*i+j)+c]], bl[c]);
-				inp[cnt] = out[cnt] = alg.sub(parity[M*i+j], bl[cnt]);
-				if (i)
-					inp[cnt+1] = out[cnt+1] = alg.sub(parity[M*(i-1)+j], bl[cnt+1]);
-				else if (j)
-					inp[cnt+1] = out[cnt+1] = alg.sub(parity[j+(q-1)*M-1], bl[cnt+1]);
-				alg.finalp(out, deg);
-				for (int d = 0; d < deg; ++d)
-					alg.update(bl+d, out[d]);
-				for (int c = 0; c < cnt; ++c)
-					data[pos[CNL*(M*i+j)+c]] = alg.add(inp[c], bl[c]);
-				parity[M*i+j] = alg.add(inp[cnt], bl[cnt]);
-				if (i)
-					parity[M*(i-1)+j] = alg.add(inp[cnt+1], bl[cnt+1]);
-				else if (j)
-					parity[j+(q-1)*M-1] = alg.add(inp[cnt+1], bl[cnt+1]);
-				bl += deg;
+			int cnt = cnc[i];		for (int j = 0; j < M; ++j) {
+			int deg = cnt + 2 - !(i|j);
+			std::vector<TYPE> inp(deg), out(deg);
+			for (int c = 0; c < cnt; ++c)
+				inp[c] = out[c] = alg.sub(data[pos[CNL*(M*i+j)+c]], bl[c]);
+			inp[cnt] = out[cnt] = alg.sub(parity[M*i+j], bl[cnt]);
+			if (i)
+				inp[cnt+1] = out[cnt+1] = alg.sub(parity[M*(i-1)+j], bl[cnt+1]);
+			else if (j)
+				inp[cnt+1] = out[cnt+1] = alg.sub(parity[j+(q-1)*M-1], bl[cnt+1]);
+			alg.finalp(out.data(), deg);
+			for (int d = 0; d < deg; ++d)
+				alg.update(bl+d, out[d]);
+			for (int c = 0; c < cnt; ++c)
+				data[pos[CNL*(M*i+j)+c]] = alg.add(inp[c], bl[c]);
+			parity[M*i+j] = alg.add(inp[cnt], bl[cnt]);
+			if (i)
+				parity[M*(i-1)+j] = alg.add(inp[cnt+1], bl[cnt+1]);
+			else if (j)
+				parity[j+(q-1)*M-1] = alg.add(inp[cnt+1], bl[cnt+1]);
+			bl += deg;
 			}
 		}
 	}
@@ -79,8 +82,13 @@ public:
 	void init(LDPCInterface *it)
 	{
 		if (initialized) {
+#ifdef _WIN32
+			_aligned_free(bnl);
+			_aligned_free(pty);
+#else
 			free(bnl);
 			free(pty);
+#endif
 			delete[] cnc;
 			delete[] pos;
 		}
@@ -108,8 +116,15 @@ public:
 		}
 		LT = ldpc->links_total();
 		delete ldpc;
+
+		// Windows compatibility for aligned_alloc
+#ifdef _WIN32
+		bnl = reinterpret_cast<TYPE *>(_aligned_malloc(sizeof(TYPE) * LT, sizeof(TYPE)));
+		pty = reinterpret_cast<TYPE *>(_aligned_malloc(sizeof(TYPE) * R, sizeof(TYPE)));
+#else
 		bnl = reinterpret_cast<TYPE *>(aligned_alloc(sizeof(TYPE), sizeof(TYPE) * LT));
 		pty = reinterpret_cast<TYPE *>(aligned_alloc(sizeof(TYPE), sizeof(TYPE) * R));
+#endif
 		uint16_t *tmp = new uint16_t[R * CNL];
 		for (int i = 0; i < q; ++i)
 			for (int j = 0; j < M; ++j)
@@ -134,8 +149,13 @@ public:
 	~LDPCDecoder()
 	{
 		if (initialized) {
+#ifdef _WIN32
+			_aligned_free(bnl);
+			_aligned_free(pty);
+#else
 			free(bnl);
 			free(pty);
+#endif
 			delete[] cnc;
 			delete[] pos;
 		}

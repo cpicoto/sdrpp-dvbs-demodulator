@@ -1,5 +1,10 @@
 #include "freq_shift.h"
 
+// Fix for MSVC M_PI definition
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 namespace dsp {
     int FreqShift::process(int count, complex_t* in, complex_t* out) {
         for (int i = 0; i < count; i++) {

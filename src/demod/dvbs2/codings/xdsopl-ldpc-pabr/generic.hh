@@ -7,6 +7,12 @@ Copyright 2018 Ahmet Inan <xdsopl@gmail.com>
 #ifndef GENERIC_HH
 #define GENERIC_HH
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include "exclusive_reduce.hh"
 
 template <typename TYPE>

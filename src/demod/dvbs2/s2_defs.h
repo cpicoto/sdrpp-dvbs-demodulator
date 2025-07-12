@@ -4,6 +4,11 @@
 #include <cmath>
 #include <dsp/types.h>
 
+// Fix for MSVC M_PI definition
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /*
 Stuff from LeanDVB, which I could for sure have re-written...
 But why? Already did what I needed :-)
