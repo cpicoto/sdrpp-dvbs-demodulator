@@ -18,6 +18,7 @@
 #include "dvbs/module_dvbs_demod.h"
 #include "dvbs2/module_dvbs2_demod.h"
 #include "dvbs2/bbframe_ts_parser.h"
+#include "dvbt/module_dvbt_demod.h"
 
 #include <gui/widgets/constellation_diagram.h>
 #include <gui/widgets/file_select.h>
@@ -85,105 +86,232 @@ const char* s2PilotsTxt[] = {
 class DVBSDemodulatorModule : public ModuleManager::Instance {
 public:
     DVBSDemodulatorModule(std::string name) {
-        this->name = name;
-
-        for (int i = 0; i < 4; i++) {
-            s2ConstellationsListTxt += s2ConstellationsTxt[i];
-            s2ConstellationsListTxt += '\0';
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Constructor starting for '{}'", name);
+        
+        try {
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Setting name");
+            this->name = name;
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Loading configuration");
+            // Load config
+            config.acquire();
+            
+            // Set default configuration if not exists
+            if (!config.conf.contains(name) || !config.conf[name].contains("hostname")) {
+                flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Creating default configuration");
+                config.conf[name]["hostname"] = "localhost";
+                config.conf[name]["port"] = 8355;
+                config.conf[name]["sending"] = false;
+                config.conf[name]["dvbs_version"] = 0;
+                config.conf[name]["dvbs_symrate"] = 250000;
+                config.conf[name]["dvbs2_symrate"] = 250000;
+                config.conf[name]["dvbs2_constellation"] = dsp::dvbs2::MOD_QPSK;
+                config.conf[name]["dvbs2_coderate"] = dsp::dvbs2::C1_2;
+                config.conf[name]["dvbs2_framesize"] = dsp::dvbs2::FECFRAME_SHORT;
+                config.conf[name]["dvbs2_pilots"] = false;
+                config.conf[name]["dvbs2_automodcod"] = false;
+                config.conf[name]["dvbs_bandwidth"] = 500000.0f;
+                config.conf[name]["dvbs2_bandwidth"] = 500000.0f;
+                config.conf[name]["dvb_mode"] = 0; // DVB-S
+                config.conf[name]["dvbt_bandwidth"] = 2; // MHz, default 2
+            }
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Reading configuration values");
+            strcpy(hostname, std::string(config.conf[name]["hostname"]).c_str());
+            port = config.conf[name]["port"];
+            bool startNow = config.conf[name]["sending"];
+            dvbs_ver_selected = config.conf[name]["dvbs_version"];
+            dvbs_sym_rate_disp = dvbs_sym_rate = config.conf[name]["dvbs_symrate"];
+            dvbs2_sym_rate_disp = dvbs2_sym_rate = config.conf[name]["dvbs2_symrate"];
+            dvbs2_cfg.constellation = config.conf[name]["dvbs2_constellation"];
+            dvbs2_cfg.coderate = config.conf[name]["dvbs2_coderate"];
+            dvbs2_cfg.framesize = config.conf[name]["dvbs2_framesize"];
+            dvbs2_cfg.pilots = true; // init later
+            auto_modcod = config.conf[name]["dvbs2_automodcod"];
+            dvbs_bw = config.conf[name]["dvbs_bandwidth"];
+            dvbs2_bw = config.conf[name]["dvbs2_bandwidth"];
+            dvb_mode = config.conf[name]["dvb_mode"];
+            dvbt_bandwidth = config.conf[name]["dvbt_bandwidth"];
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Config values - DVB mode: {}, DVB-T BW: {} MHz, Network: {}:{}", 
+                      dvb_mode, dvbt_bandwidth, hostname, port);
+            
+            config.release(true);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Creating VFO");
+            vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, dvbs_bw, dvbs_sym_rate*2.0f, 1000.0f, dvbs_sym_rate*2.5f, false);
+            onUserChangedBandwidthHandler.handler = vfoUserChangedBandwidthHandler;
+            onUserChangedBandwidthHandler.ctx = this;
+            vfo->wtfVFO->onUserChangedBandwidth.bindHandler(&onUserChangedBandwidthHandler);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Calculating clock recovery coefficients");
+            // Clock recovery coefficients
+            float recov_bandwidth = CLOCK_RECOVERY_BW;
+            float recov_dampningFactor = CLOCK_RECOVERY_DAMPN_F;
+            float recov_denominator = (1.0f + 2.0*recov_dampningFactor*recov_bandwidth + recov_bandwidth*recov_bandwidth);
+            float recov_mu = (4.0f * recov_dampningFactor * recov_bandwidth) / recov_denominator;
+            float recov_omega = (4.0f * recov_bandwidth * recov_bandwidth) / recov_denominator;
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Creating constellation lists");
+            // Create lists
+            s2ConstellationsListTxt = "";
+            for (int i = 0; i < 4; i++) {
+                s2ConstellationsListTxt += s2ConstellationsTxt[i];
+                if (i < 3) { s2ConstellationsListTxt += '\0'; }
+            }
+            
+            s2CoderatesListTxt = "";
+            for (int i = 0; i < 12; i++) {
+                s2CoderatesListTxt += s2CoderatesTxt[i];
+                if (i < 11) { s2CoderatesListTxt += '\0'; }
+            }
+            
+            s2FramesizesListTxt = "";
+            for (int i = 0; i < 2; i++) {
+                s2FramesizesListTxt += s2FramesizesTxt[i];
+                if (i < 1) { s2FramesizesListTxt += '\0'; }
+            }
+            
+            s2PilotsListTxt = "";
+            for (int i = 0; i < 2; i++) {
+                s2PilotsListTxt += s2PilotsTxt[i];
+                if (i < 1) { s2PilotsListTxt += '\0'; }
+            }
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Initializing constellation diagram");
+            constDiag.init();
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Initializing DVB-S demodulator");
+            dvbsDemod.init(vfo->output, dvbs_sym_rate, dvbs_sym_rate*2, AGC_RATE, RRC_ALPHA, RRC_TAP_COUNT, COSTAS_LOOP_BANDWIDTH, FLL_LOOP_BANDWIDTH, recov_omega, recov_mu, _constDiagHandler, this, CLOCK_RECOVERY_REL_LIM);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Initializing DVB-S2 demodulator");
+            dvbs2Demod.init(vfo->output, dvbs2_sym_rate, dvbs2_sym_rate*2, AGC_RATE, RRC_ALPHA, RRC_TAP_COUNT, COSTAS_LOOP_BANDWIDTH, FLL_LOOP_BANDWIDTH, recov_omega, recov_mu, _constDiagHandler, this, dsp::dvbs2::get_dvbs2_modcod(dvbs2_cfg), (dvbs2_cfg.framesize == dsp::dvbs2::FECFRAME_SHORT), (dvbs2_cfg.pilots), DVBS2_DEMOD_SOF_THRES, DVBS2_DEMOD_LDPC_RETRIES, CLOCK_RECOVERY_REL_LIM);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Reading DVB-S2 pilots config");
+            config.acquire();
+            dvbs2_cfg.pilots = config.conf[name]["dvbs2_pilots"];
+            config.release();
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Updating S2 demodulator");
+            updateS2Demod();
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: DVB-T demodulator will be initialized in enable()");
+            // NOTE: DVB-T demodulator will be initialized in enable() after VFO is created
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Initializing DVB-T averaging arrays");
+            // Initialize DVB-T averaging arrays
+            for (int i = 0; i < 30; i++) {
+                dvbt_snr_avg[i] = 0.0f;
+                dvbt_freq_offset_avg[i] = 0.0f;
+            }
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Initializing demod sink");
+            demodSink.init(&dvbsDemod.out, _demodSinkHandler, this);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Setting initial mode");
+            setMode();
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Checking if should start network");
+            if(startNow) {
+                flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Starting network");
+                startNetwork();
+            }
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Registering menu entry");
+            gui::menu.registerEntry(name, menuHandler, this, this);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Constructor completed successfully for '{}'", name);
+        } catch (const std::exception& e) {
+            flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Constructor failed for '{}': {}", name, e.what());
+            throw;
+        } catch (...) {
+            flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Constructor failed for '{}' with unknown error", name);
+            throw;
         }
-        for (int i = 0; i < 12; i++) {
-            s2CoderatesListTxt += s2CoderatesTxt[i];
-            s2CoderatesListTxt += '\0';
-        }
-        for (int i = 0; i < 2; i++) {
-            s2FramesizesListTxt += s2FramesizesTxt[i];
-            s2FramesizesListTxt += '\0';
-        }
-        for (int i = 0; i < 2; i++) {
-            s2PilotsListTxt += s2PilotsTxt[i];
-            s2PilotsListTxt += '\0';
-        }
-
-        // Load config
-        config.acquire();
-        if (!config.conf.contains(name) || !config.conf[name].contains("hostname")) {
-            config.conf[name]["hostname"] = "localhost";
-            config.conf[name]["port"] = 8355;
-            config.conf[name]["sending"] = false;
-            config.conf[name]["dvbs_version"] = dvbs_ver_selected;
-            config.conf[name]["dvbs_symrate"] = dvbs_sym_rate;
-            config.conf[name]["dvbs2_symrate"] = dvbs2_sym_rate;
-            config.conf[name]["dvbs2_constellation"] = dsp::dvbs2::MOD_QPSK;
-            config.conf[name]["dvbs2_coderate"] = dsp::dvbs2::C1_2;
-            config.conf[name]["dvbs2_framesize"] = dsp::dvbs2::FECFRAME_SHORT;
-            config.conf[name]["dvbs2_pilots"] = false;
-            config.conf[name]["dvbs2_automodcod"] = false;
-            config.conf[name]["dvbs_bandwidth"] = dvbs_bw;
-            config.conf[name]["dvbs2_bandwidth"] = dvbs2_bw;
-        }
-        strcpy(hostname, std::string(config.conf[name]["hostname"]).c_str());
-        port = config.conf[name]["port"];
-        bool startNow = config.conf[name]["sending"];
-        dvbs_ver_selected = config.conf[name]["dvbs_version"];
-        dvbs_sym_rate_disp = dvbs_sym_rate = config.conf[name]["dvbs_symrate"];
-        dvbs2_sym_rate_disp = dvbs2_sym_rate =  config.conf[name]["dvbs2_symrate"];
-        dvbs2_cfg.constellation = config.conf[name]["dvbs2_constellation"];
-        dvbs2_cfg.coderate = config.conf[name]["dvbs2_coderate"];
-        dvbs2_cfg.framesize = config.conf[name]["dvbs2_framesize"];
-        dvbs2_cfg.pilots = true; //init later
-        auto_modcod = config.conf[name]["dvbs2_automodcod"];
-        dvbs_bw = config.conf[name]["dvbs_bandwidth"];
-        dvbs2_bw = config.conf[name]["dvbs2_bandwidth"];
-        config.release(true);
-
-        vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, dvbs_bw, dvbs_sym_rate*2.0f, 1000.0f, dvbs_sym_rate*2.5f, false);
-        onUserChangedBandwidthHandler.handler = vfoUserChangedBandwidthHandler;
-        onUserChangedBandwidthHandler.ctx = this;
-        vfo->wtfVFO->onUserChangedBandwidth.bindHandler(&onUserChangedBandwidthHandler);
-        //Clock recov coeffs
-        float recov_bandwidth = CLOCK_RECOVERY_BW;
-        float recov_dampningFactor = CLOCK_RECOVERY_DAMPN_F;
-        float recov_denominator = (1.0f + 2.0*recov_dampningFactor*recov_bandwidth + recov_bandwidth*recov_bandwidth);
-        float recov_mu = (4.0f * recov_dampningFactor * recov_bandwidth) / recov_denominator;
-        float recov_omega = (4.0f * recov_bandwidth * recov_bandwidth) / recov_denominator;
-        dvbsDemod.init(vfo->output, dvbs_sym_rate, dvbs_sym_rate*2, AGC_RATE, RRC_ALPHA, RRC_TAP_COUNT, COSTAS_LOOP_BANDWIDTH, FLL_LOOP_BANDWIDTH, recov_omega, recov_mu, _constDiagHandler, this, CLOCK_RECOVERY_REL_LIM);
-        dvbs2Demod.init(vfo->output, dvbs2_sym_rate, dvbs2_sym_rate*2, AGC_RATE, RRC_ALPHA, RRC_TAP_COUNT, COSTAS_LOOP_BANDWIDTH, FLL_LOOP_BANDWIDTH, recov_omega, recov_mu, _constDiagHandler, this, dsp::dvbs2::get_dvbs2_modcod(dvbs2_cfg), (dvbs2_cfg.framesize == dsp::dvbs2::FECFRAME_SHORT), (dvbs2_cfg.pilots), DVBS2_DEMOD_SOF_THRES, DVBS2_DEMOD_LDPC_RETRIES, CLOCK_RECOVERY_REL_LIM);
-        dvbs2_cfg.pilots = config.conf[name]["dvbs2_pilots"];
-        updateS2Demod();
-        demodSink.init(&dvbsDemod.out, _demodSinkHandler, this);
-
-        setMode();
-
-        if(startNow) {
-            startNetwork();
-        }
-
-        gui::menu.registerEntry(name, menuHandler, this, this);
     }
 
     ~DVBSDemodulatorModule() {
-        if(isEnabled()) {
-            disable();
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Destructor called for '{}'", name);
+        
+        try {
+            if(isEnabled()) {
+                flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Disabling module during destruction");
+                disable();
+            }
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Unregistering menu entry");
+            gui::menu.removeEntry(name);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Unregistering sink stream");
+            sigpath::sinkManager.unregisterStream(name);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Destructor completed for '{}'", name);
+        } catch (const std::exception& e) {
+            flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Destructor failed for '{}': {}", name, e.what());
+        } catch (...) {
+            flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Destructor failed for '{}' with unknown error", name);
         }
-        gui::menu.removeEntry(name);
-        sigpath::sinkManager.unregisterStream(name);
     }
 
     void postInit() {}
 
     void enable() {
-        vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, dvbs_sym_rate*2.0f, dvbs_sym_rate*2.0f, 1000.0f, dvbs_sym_rate*2.5f, false);
-        vfo->wtfVFO->onUserChangedBandwidth.bindHandler(&onUserChangedBandwidthHandler);
-        setMode();
-        enabled = true;
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: enable() called for module '{}'", name);
+        
+        try {
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Creating VFO for module '{}'", name);
+            vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, dvbs_sym_rate*2.0f, dvbs_sym_rate*2.0f, 1000.0f, dvbs_sym_rate*2.5f, false);
+            vfo->wtfVFO->onUserChangedBandwidth.bindHandler(&onUserChangedBandwidthHandler);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: VFO created successfully");
+            
+            // Now initialize DVB-T demodulator with valid VFO
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Initializing DVB-T demodulator with bandwidth {} MHz", dvbt_bandwidth);
+            dvbtDemod.init(vfo->output, dvbt_bandwidth);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Setting DVB-T constellation handler");
+            dvbtDemod.setConstellationHandler(_constDiagHandler, this);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Enabling DVB-T debug output");
+            dvbtDemod.setDebugOutput(true);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: DVB-T demodulator initialization successful");
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Setting initial mode");
+            setMode();
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Module '{}' enabled successfully", name);
+            enabled = true;
+        } catch (const std::exception& e) {
+            flog::error("DVB-S/DVB-S2/DVB-T Demodulator: enable() failed for '{}': {}", name, e.what());
+            throw;
+        } catch (...) {
+            flog::error("DVB-S/DVB-S2/DVB-T Demodulator: enable() failed for '{}' with unknown error", name);
+            throw;
+        }
     }
 
     void disable() {
-        demodSink.stop();
-        dvbsDemod.stop();
-        dvbs2Demod.stop();
-        sigpath::vfoManager.deleteVFO(vfo);
-        enabled = false;
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: disable() called for module '{}'", name);
+        
+        try {
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Stopping demodulators");
+            // Stop DSP here
+            demodSink.stop();
+            dvbsDemod.stop();
+            dvbs2Demod.stop();
+            dvbtDemod.stop();
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Deleting VFO");
+            sigpath::vfoManager.deleteVFO(vfo);
+            
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Module '{}' disabled successfully", name);
+            enabled = false;
+        } catch (const std::exception& e) {
+            flog::error("DVB-S/DVB-S2/DVB-T Demodulator: disable() failed for '{}': {}", name, e.what());
+        } catch (...) {
+            flog::error("DVB-S/DVB-S2/DVB-T Demodulator: disable() failed for '{}' with unknown error", name);
+        }
     }
 
     bool isEnabled() {
@@ -213,18 +341,29 @@ private:
         demodSink.stop();
         dvbsDemod.stop();
         dvbs2Demod.stop();
-        if(dvbs_ver_selected == 0) {
+        dvbtDemod.stop();
+        
+        if(dvb_mode == 0) {  // DVB-S
+            dvbs_ver_selected = 0;
             dvbsDemod.setInput(vfo->output);
             demodSink.setInput(&dvbsDemod.out);
             dvbsDemod.start();
             demodSink.start();
             setSymRate();
-        } else {
+        } else if(dvb_mode == 1) {  // DVB-S2
+            dvbs_ver_selected = 1;
             dvbs2Demod.setInput(vfo->output);
             demodSink.setInput(&dvbs2Demod.out);
             dvbs2Demod.start();
             demodSink.start();
             setSymRate();
+        } else if(dvb_mode == 2) {  // DVB-T
+            dvbtDemod.setInput(vfo->output);
+            dvbtDemod.setBandwidth(dvbt_bandwidth);
+            demodSink.setInput(&dvbtDemod.out);
+            dvbtDemod.start();
+            demodSink.start();
+            setDVBTSampleRate();
         }
     }
 
@@ -262,6 +401,16 @@ private:
         dvbs2bbparser.setFrameSize(dvbs2Demod.getKBCH());
     }
 
+    void setDVBTSampleRate() {
+        double samplerate = dvbt_bandwidth * 1000000.0;  // Convert MHz to Hz
+        double bandwidth = samplerate * 0.8;  // 80% of sample rate for bandwidth
+        
+        vfo->setSampleRate(samplerate, bandwidth);
+        vfo->setBandwidthLimits(samplerate * 0.1, samplerate * 1.2, false);
+        dvbtDemod.setSamplerate(samplerate);
+        dvbtDemod.reset();
+    }
+
     static void menuHandler(void* ctx) {
         DVBSDemodulatorModule* _this = (DVBSDemodulatorModule*)ctx;
         float menuWidth = ImGui::GetContentRegionAvail().x;
@@ -271,24 +420,49 @@ private:
         }
 
         ImGui::BeginGroup();
-        ImGui::Columns(2, CONCAT("DVBSModeColumns##_", _this->name), false);
-        if (ImGui::RadioButton(CONCAT("DVBS-QPSK##_", _this->name), _this->dvbs_ver_selected == 0) && _this->dvbs_ver_selected != 0) {
-            _this->dvbs_ver_selected = 0; //dvb-s
+        ImGui::Columns(3, CONCAT("DVBSModeColumns##_", _this->name), false);
+        if (ImGui::RadioButton(CONCAT("DVB-S##_", _this->name), _this->dvb_mode == 0) && _this->dvb_mode != 0) {
+            _this->dvb_mode = 0;
+            _this->dvbs_ver_selected = 0;
             _this->setMode();
             config.acquire();
-            config.conf[_this->name]["dvbs_version"] = _this->dvbs_ver_selected;
+            config.conf[_this->name]["dvb_mode"] = _this->dvb_mode;
             config.release(true);
         }
         ImGui::NextColumn();
-        if (ImGui::RadioButton(CONCAT("DVBS2##_", _this->name), _this->dvbs_ver_selected == 1) && _this->dvbs_ver_selected != 1) {
-            _this->dvbs_ver_selected = 1; //dvb-s2
+        if (ImGui::RadioButton(CONCAT("DVB-S2##_", _this->name), _this->dvb_mode == 1) && _this->dvb_mode != 1) {
+            _this->dvb_mode = 1;
+            _this->dvbs_ver_selected = 1;
             _this->setMode();
             config.acquire();
-            config.conf[_this->name]["dvbs_version"] = _this->dvbs_ver_selected;
+            config.conf[_this->name]["dvb_mode"] = _this->dvb_mode;
+            config.release(true);
+        }
+        ImGui::NextColumn();
+        if (ImGui::RadioButton(CONCAT("DVB-T##_", _this->name), _this->dvb_mode == 2) && _this->dvb_mode != 2) {
+            _this->dvb_mode = 2;
+            _this->setMode();
+            config.acquire();
+            config.conf[_this->name]["dvb_mode"] = _this->dvb_mode;
             config.release(true);
         }
         ImGui::Columns(1, CONCAT("EndDVBSModeColumns##_", _this->name), false);
         ImGui::EndGroup();
+
+        if (_this->dvb_mode == 2) {
+            ImGui::Text("Bandwidth (MHz):");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());
+            static const char* bw_options[] = {"1", "2", "3", "4", "5", "6", "7", "8"};
+            int bw_idx = _this->dvbt_bandwidth - 1;
+            if (ImGui::Combo(CONCAT("##_dvbt_bandwidth_", _this->name), &bw_idx, bw_options, 8)) {
+                _this->dvbt_bandwidth = bw_idx + 1;
+                _this->setDVBTSampleRate();
+                config.acquire();
+                config.conf[_this->name]["dvbt_bandwidth"] = _this->dvbt_bandwidth;
+                config.release(true);
+            }
+        }
 
 #ifdef ENABLE_NNG_NETWORKING
         bool netActive = (_this->conn && _this->conn->isOpen());
@@ -341,7 +515,7 @@ private:
         } else {
             ImGui::TextUnformatted("Idle");
         }
-        if(_this->dvbs_ver_selected == 0) {
+        if(_this->dvb_mode == 0) {  // DVB-S
             ImGui::Text("Symbol rate: ");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());
@@ -376,7 +550,7 @@ private:
             if(!_this->dvbsDemod.stats_viterbi_lock) {
                 style::endDisabled();
             }
-        } else {
+        } else if(_this->dvb_mode == 1) {  // DVB-S2
             ImGui::Text("Symbol rate: ");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());
@@ -520,6 +694,65 @@ private:
             if(!(avg_bestmatch >= DVBS2_DEMOD_SOF_THRES*100.0f)) {
                 style::endDisabled();
             }
+        } else if(_this->dvb_mode == 2) {  // DVB-T mode
+            // Update DVB-T TPS info
+            _this->dvbt_tps_info = _this->dvbtDemod.getTPS();
+            
+            // Display TPS lock status
+            ImGui::Text("TPS Lock: ");
+            ImGui::SameLine();
+            if(_this->dvbt_tps_info.locked) {
+                ImGui::TextColored(ImVec4(0.0, 1.0, 0.0, 1.0), "LOCKED");
+            } else {
+                ImGui::TextColored(ImVec4(1.0, 0.0, 0.0, 1.0), "UNLOCKED");
+            }
+            
+            if(_this->dvbt_tps_info.locked) {
+                // Display TPS parameters
+                ImGui::Text("Mode: %s", (_this->dvbt_tps_info.mode == dsp::dvbt::DVBT_MODE_2K) ? "2K" : "8K");
+                ImGui::Text("Modulation: %s", 
+                    (_this->dvbt_tps_info.modulation == dsp::dvbt::DVBT_MOD_QPSK) ? "QPSK" :
+                    (_this->dvbt_tps_info.modulation == dsp::dvbt::DVBT_MOD_16QAM) ? "16QAM" : "64QAM");
+                ImGui::Text("Code Rate: %s",
+                    (_this->dvbt_tps_info.code_rate_hp == dsp::dvbt::DVBT_CR_1_2) ? "1/2" :
+                    (_this->dvbt_tps_info.code_rate_hp == dsp::dvbt::DVBT_CR_2_3) ? "2/3" :
+                    (_this->dvbt_tps_info.code_rate_hp == dsp::dvbt::DVBT_CR_3_4) ? "3/4" :
+                    (_this->dvbt_tps_info.code_rate_hp == dsp::dvbt::DVBT_CR_5_6) ? "5/6" : "7/8");
+                ImGui::Text("Guard Interval: %s",
+                    (_this->dvbt_tps_info.guard_interval == dsp::dvbt::DVBT_GI_1_32) ? "1/32" :
+                    (_this->dvbt_tps_info.guard_interval == dsp::dvbt::DVBT_GI_1_16) ? "1/16" :
+                    (_this->dvbt_tps_info.guard_interval == dsp::dvbt::DVBT_GI_1_8) ? "1/8" : "1/4");
+                
+                // Calculate and display averaged SNR
+                _this->dvbt_snr_avg[_this->dvbt_snr_avg_ptr] = _this->dvbt_tps_info.snr_estimate;
+                _this->dvbt_snr_avg_ptr++;
+                if(_this->dvbt_snr_avg_ptr >= 30) _this->dvbt_snr_avg_ptr = 0;
+                
+                float avg_snr = 0;
+                for(int i = 0; i < 30; i++) {
+                    avg_snr += _this->dvbt_snr_avg[i];
+                }
+                avg_snr /= 30.0f;
+                
+                ImGui::Text("SNR: %.1f dB", avg_snr);
+                ImGui::SameLine();
+                ImGui::SigQualityMeter(avg_snr, 0.0f, 30.0f);
+                
+                // Calculate and display averaged frequency offset
+                _this->dvbt_freq_offset_avg[_this->dvbt_freq_offset_avg_ptr] = _this->dvbt_tps_info.frequency_offset;
+                _this->dvbt_freq_offset_avg_ptr++;
+                if(_this->dvbt_freq_offset_avg_ptr >= 30) _this->dvbt_freq_offset_avg_ptr = 0;
+                
+                float avg_freq_offset = 0;
+                for(int i = 0; i < 30; i++) {
+                    avg_freq_offset += _this->dvbt_freq_offset_avg[i];
+                }
+                avg_freq_offset /= 30.0f;
+                
+                ImGui::Text("Freq Offset: %.1f Hz", avg_freq_offset);
+            } else {
+                ImGui::Text("Searching for TPS...");
+            }
         }
         ImGui::Text("Signal+PLSCode constellation: ");
         ImGui::SetNextItemWidth(menuWidth);
@@ -584,16 +817,19 @@ private:
     static void vfoUserChangedBandwidthHandler(double newBw, void* ctx) {
         DVBSDemodulatorModule* _this = (DVBSDemodulatorModule*)ctx;
         _this->vfo->setBandwidth(newBw);
-        if(_this->dvbs_ver_selected == 0) {
+        if(_this->dvb_mode == 0) {  // DVB-S
             _this->dvbs_bw = newBw;
             config.acquire();
             config.conf[_this->name]["dvbs_bandwidth"] = _this->dvbs_bw;
             config.release(true);
-        } else {
+        } else if(_this->dvb_mode == 1) {  // DVB-S2
             _this->dvbs2_bw = newBw;
             config.acquire();
             config.conf[_this->name]["dvbs2_bandwidth"] = _this->dvbs2_bw;
             config.release(true);
+        } else if(_this->dvb_mode == 2) {  // DVB-T
+            // DVB-T bandwidth is controlled by the bandwidth dropdown, not VFO
+            // So we don't need to do anything here for DVB-T
         }
     }
 
@@ -601,6 +837,8 @@ private:
     bool enabled = true;
 
     int dvbs_ver_selected = 0;
+    int dvb_mode = 0; // 0 = DVB-S, 1 = DVB-S2, 2 = DVB-T
+    int dvbt_bandwidth = 2; // MHz, default 2
 
     VFOManager::VFO* vfo;
     float dvbs_bw = 250000*2.0f;
@@ -628,6 +866,14 @@ private:
     dsp::dvbs2::BBFrameTSParser dvbs2bbparser;
     uint8_t packetbuff[65536*10];
 
+    // DVB-T demodulator
+    dsp::dvbt::DVBTDemod dvbtDemod;
+    dsp::dvbt::TPSInfo dvbt_tps_info;
+    float dvbt_snr_avg[30];
+    int dvbt_snr_avg_ptr = 0;
+    float dvbt_freq_offset_avg[30];
+    int dvbt_freq_offset_avg_ptr = 0;
+
     dsp::sink::Handler<uint8_t> demodSink;
 
     EventHandler<double> onUserChangedBandwidthHandler;
@@ -647,22 +893,80 @@ private:
 };
 
 MOD_EXPORT void _INIT_() {
-    std::string root = (std::string)core::args["root"];
-    json def = json({});
-    config.setPath(root + "/dvbs_demodulator_config.json");
-    config.load(def);
-    config.enableAutoSave();
+    flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Module _INIT_ called");
+    try {
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Getting root path from core args");
+        std::string root = (std::string)core::args["root"];
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Root path: '{}'", root);
+        
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Creating default config");
+        json def = json({});
+        
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Setting config path");
+        config.setPath(root + "/dvbs_demodulator_config.json");
+        
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Loading config");
+        config.load(def);
+        
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Enabling auto save");
+        config.enableAutoSave();
+        
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Module _INIT_ completed successfully");
+    } catch (const std::exception& e) {
+        flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Module _INIT_ failed: {}", e.what());
+        throw;
+    } catch (...) {
+        flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Module _INIT_ failed with unknown error");
+        throw;
+    }
 }
 
 MOD_EXPORT ModuleManager::Instance* _CREATE_INSTANCE_(std::string name) {
-    return new DVBSDemodulatorModule(name);
+    flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Creating instance '{}'", name);
+    try {
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Calling constructor for '{}'", name);
+        auto* instance = new DVBSDemodulatorModule(name);
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Instance '{}' created successfully", name);
+        return instance;
+    } catch (const std::exception& e) {
+        flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Failed to create instance '{}': {}", name, e.what());
+        throw;
+    } catch (...) {
+        flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Failed to create instance '{}' with unknown error", name);
+        throw;
+    }
 }
 
 MOD_EXPORT void _DELETE_INSTANCE_(void* instance) {
-    delete (DVBSDemodulatorModule*)instance;
+    flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Deleting instance");
+    try {
+        if (instance) {
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Calling destructor");
+            delete (DVBSDemodulatorModule*)instance;
+            flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Instance deleted successfully");
+        } else {
+            flog::warn("DVB-S/DVB-S2/DVB-T Demodulator: Instance pointer is null");
+        }
+    } catch (const std::exception& e) {
+        flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Failed to delete instance: {}", e.what());
+    } catch (...) {
+        flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Failed to delete instance with unknown error");
+    }
 }
 
 MOD_EXPORT void _END_() {
-    config.disableAutoSave();
-    config.save();
+    flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Module _END_ called");
+    try {
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Disabling auto save");
+        config.disableAutoSave();
+        
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Saving config");
+        config.save();
+        
+        flog::info("DVB-S/DVB-S2/DVB-T Demodulator: Module _END_ completed successfully");
+    } catch (const std::exception& e) {
+        flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Module _END_ failed: {}", e.what());
+    } catch (...) {
+        flog::error("DVB-S/DVB-S2/DVB-T Demodulator: Module _END_ failed with unknown error");
+    }
 }
